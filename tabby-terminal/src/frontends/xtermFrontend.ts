@@ -174,6 +174,31 @@ export class XTermFrontend extends Frontend {
                 event.stopPropagation()
                 event.preventDefault()
                 ret = false
+            } else if (
+                // Fallback for Ctrl+Alt+<letter>: xterm.js 5.4.0
+                // _isThirdLevelShift() short-circuits this combo on Windows
+                // (treating Ctrl+Alt as AltGr), so the expected ESC + Ctrl-letter
+                // byte (e.g. ^[^H for Ctrl+Alt+H) is never emitted. Only run this
+                // after Tabby's own hotkey matcher has rejected the event, and
+                // skip real AltGr keystrokes so US-International and similar
+                // layouts keep producing their composed characters.
+                name === 'keydown' &&
+                event.ctrlKey && event.altKey && !event.metaKey &&
+                !event.getModifierState('AltGraph')
+            ) {
+                let letter: string | null = null
+                if (typeof event.key === 'string' && /^[a-zA-Z]$/.test(event.key)) {
+                    letter = event.key.toUpperCase()
+                } else if (typeof event.code === 'string' && /^Key[A-Z]$/.test(event.code)) {
+                    letter = event.code.slice(3)
+                }
+                if (letter) {
+                    const code = letter.charCodeAt(0) - 64
+                    this.input.next(Buffer.from([0x1b, code]))
+                    event.stopPropagation()
+                    event.preventDefault()
+                    ret = false
+                }
             }
             return ret
         }
