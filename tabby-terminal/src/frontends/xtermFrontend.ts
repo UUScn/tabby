@@ -182,7 +182,11 @@ export class XTermFrontend extends Frontend {
                 // after Tabby's own hotkey matcher has rejected the event, and
                 // skip real AltGr keystrokes so US-International and similar
                 // layouts keep producing their composed characters.
-                name === 'keydown' &&
+                // NOTE: gate on event.type (the real DOM event) rather than the
+                // `name` parameter, because attachCustomKeyEventHandler is
+                // invoked from xterm's internal _keyUp as well and always
+                // passes 'keydown' here, which would otherwise emit twice.
+                event.type === 'keydown' &&
                 event.ctrlKey && event.altKey && !event.metaKey &&
                 !event.getModifierState('AltGraph')
             ) {
