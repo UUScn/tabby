@@ -5,7 +5,8 @@ import { EnvironmentInjector, inject, Injectable } from '@angular/core'
 import { TerminalDecorator } from '../api/decorator'
 import { BaseTerminalTabComponent } from '../api/baseTerminalTab.component'
 import { SessionMiddleware } from '../api/middleware'
-import { LogService, Logger, PlatformService, FileUpload, TranslateService } from 'tabby-core'
+import { BaseSession } from '../session'
+import { LogService, Logger, PlatformService, FileUpload, HTMLFileUpload, TranslateService } from 'tabby-core'
 
 const SPACER = '            '
 
@@ -15,6 +16,9 @@ class ZModemMiddleware extends SessionMiddleware {
     private logger: Logger
     private activeSession: any = null
     private cancelEvent: Observable<any>
+    private pendingFiles: File[] | null = null
+    private uploadTimeout: ReturnType<typeof setTimeout> | null = null
+    private detecting = false
 
     private log = inject(LogService)
     private translate = inject(TranslateService)
@@ -33,24 +37,31 @@ class ZModemMiddleware extends SessionMiddleware {
             },
             sender: data => this.outputToSession.next(Buffer.from(data)),
             on_detect: async detection => {
-                if ((await this.platform.showMessageBox({
-                    type: 'warning',
-                    message: this.translate.instant('Accept a ZMODEM session?'),
-                    detail: this.translate.instant('If you have not requested it, it could be a sign of malicious activity.'),
-                    buttons: [
-                        this.translate.instant('Accept'),
-                        this.translate.instant('Reject'),
-                    ],
-                    defaultId: 0,
-                    cancelId: 1,
-                })).response === 1) {
-                    return
-                }
-
+                this.detecting = true
+                const files = detection.get_session_role() === 'send' ? this.pendingFiles : null
+                this.clearPendingUpload()
                 try {
+                    if (!files && (await this.platform.showMessageBox({
+                        type: 'warning',
+                        message: this.translate.instant('Accept a ZMODEM session?'),
+                        detail: this.translate.instant('If you have not requested it, it could be a sign of malicious activity.'),
+                        buttons: [
+                            this.translate.instant('Accept'),
+                            this.translate.instant('Reject'),
+                        ],
+                        defaultId: 0,
+                        cancelId: 1,
+                    })).response === 1) {
+                        return
+                    }
+
                     this.isActive = true
-                    await this.process(detection)
+                    await this.process(detection, files)
+                } catch (error) {
+                    this.logger.error('ZMODEM session error', error)
+                    this.showMessage(colors.bgRed.black(' ZMODEM ') + ` Session failed: ${error.message}`)
                 } finally {
+                    this.detecting = false
                     this.isActive = false
                 }
             },
@@ -58,8 +69,51 @@ class ZModemMiddleware extends SessionMiddleware {
                 this.showMessage('transfer cancelled')
                 this.activeSession = null
                 this.isActive = false
+                this.clearPendingUpload()
             },
         })
+    }
+
+    uploadFromDrop (event: DragEvent): void {
+        const files = Array.from(event.dataTransfer?.files ?? [])
+        if (!files.length) {
+            return
+        }
+        if (this.pendingFiles || this.detecting || this.isActive || this.activeSession) {
+            this.showMessage('A ZMODEM transfer is already pending or in progress.')
+            return
+        }
+        if (Array.from(event.dataTransfer?.items ?? []).some(item => item.webkitGetAsEntry()?.isDirectory)) {
+            this.showMessage('ZMODEM uploads files only. Please archive folders before uploading.')
+            return
+        }
+
+        this.pendingFiles = files
+        this.uploadTimeout = setTimeout(() => {
+            this.clearPendingUpload()
+            this.showMessage('ZMODEM upload timed out. Make sure rz is installed and the terminal is at a shell prompt.')
+        }, 15000)
+        this.outputToSession.next(Buffer.from('rz\r'))
+    }
+
+    feedFromTerminal (data: Buffer): void {
+        if (data.includes(3)) {
+            this.clearPendingUpload()
+        }
+        super.feedFromTerminal(data)
+    }
+
+    close (): void {
+        this.clearPendingUpload()
+        super.close()
+    }
+
+    private clearPendingUpload (): void {
+        if (this.uploadTimeout) {
+            clearTimeout(this.uploadTimeout)
+            this.uploadTimeout = null
+        }
+        this.pendingFiles = null
     }
 
     feedFromSession (data: Buffer): void {
@@ -86,7 +140,7 @@ class ZModemMiddleware extends SessionMiddleware {
         }
     }
 
-    private async process (detection): Promise<void> {
+    private async process (detection, files: File[] | null): Promise<void> {
         this.showMessage(colors.bgBlue.black(' ZMODEM ') + ' Session started')
         this.showMessage('------------------------')
 
@@ -96,7 +150,9 @@ class ZModemMiddleware extends SessionMiddleware {
 
         try {
             if (zsession.type === 'send') {
-                const transfers = await this.platform.startUpload({ multiple: true })
+                const transfers = files
+                    ? files.map(file => new HTMLFileUpload(file))
+                    : await this.platform.startUpload({ multiple: true })
                 let filesRemaining = transfers.length
                 let sizeRemaining = transfers.reduce((a, b) => a + b.getSize(), 0)
                 for (const transfer of transfers) {
@@ -263,6 +319,7 @@ class ZModemMiddleware extends SessionMiddleware {
 @Injectable()
 export class ZModemDecorator extends TerminalDecorator {
     #injector = inject(EnvironmentInjector)
+    private middlewares = new WeakMap<BaseSession, ZModemMiddleware>()
 
     attach (terminal: BaseTerminalTabComponent<any>): void {
         setTimeout(() => {
@@ -270,13 +327,25 @@ export class ZModemDecorator extends TerminalDecorator {
             this.subscribeUntilDetached(terminal, terminal.sessionChanged$.subscribe(() => {
                 this.attachToSession(terminal)
             }))
+            this.subscribeUntilDetached(terminal, terminal.frontend?.dragOver$.subscribe(event => {
+                event.preventDefault()
+            }))
+            this.subscribeUntilDetached(terminal, terminal.frontend?.drop$.subscribe(event => {
+                event.preventDefault()
+                if (terminal.session?.open) {
+                    this.middlewares.get(terminal.session)?.uploadFromDrop(event)
+                    terminal.frontend?.focus()
+                }
+            }))
         })
     }
 
     private attachToSession (terminal: BaseTerminalTabComponent<any>) {
-        if (!terminal.session) {
+        if (!terminal.session || this.middlewares.has(terminal.session)) {
             return
         }
-        terminal.session.middleware.unshift(this.#injector.runInContext(() => new ZModemMiddleware()))
+        const middleware = this.#injector.runInContext(() => new ZModemMiddleware())
+        this.middlewares.set(terminal.session, middleware)
+        terminal.session.middleware.unshift(middleware)
     }
 }

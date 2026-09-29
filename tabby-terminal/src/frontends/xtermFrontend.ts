@@ -368,7 +368,7 @@ export class XTermFrontend extends Frontend {
                 requestAnimationFrame(() => this.updatePinnedState())
             })
 
-        host.addEventListener('dragOver', (event: any) => this.dragOver.next(event))
+        host.addEventListener('dragover', (event: DragEvent) => this.dragOver.next(event))
         host.addEventListener('drop', event => this.drop.next(event))
 
         host.addEventListener('mousedown', event => this.mouseEvent.next(event))
